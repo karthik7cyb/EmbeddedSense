@@ -1,0 +1,14 @@
+python-dotenv
+
+google-genai
+groq
+
+fastapi
+uvicorn
+
+pymupdf
+
+
+psycopg[binary]
+pgvector
+psycopg-pool
