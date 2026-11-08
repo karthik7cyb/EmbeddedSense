@@ -38,7 +38,7 @@ async def chat(
     Query parameter:
         /llm?prompt=Why%20does%20my%20ESP32%20reset
 
-    Streams the response using Server-Sent Events.
+    Streams the response.
     """
 
     user_prompt = (request.prompt if request else None) or prompt
@@ -51,7 +51,7 @@ async def chat(
 
     return StreamingResponse(
         chat_service.chat(user_prompt.strip()),
-        media_type="text/event-stream",
+        media_type="text/plain",
         status_code=200,
         headers={
             "Cache-Control": "no-cache",

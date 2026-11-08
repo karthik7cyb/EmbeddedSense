@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 
 from collections.abc import AsyncIterator
 
@@ -16,6 +17,12 @@ logger = logging.getLogger("uvicorn.error")
 NO_CONTEXT_MESSAGE = (
     "I couldn't find relevant information in the available "
     "hardware documentation to answer your question."
+)
+
+
+PAGE_CITATION_PATTERN = re.compile(
+    r"\s*\((?:see\s+)?pages?\s*[^)]*\d+[^)]*\)",
+    re.IGNORECASE
 )
 
 
@@ -70,6 +77,86 @@ class ChatService:
                 await asyncio.sleep(sleep_time)
 
     # ---------------------------------------------------------
+    # CLEAN STREAM (REMOVE PAGE CITATIONS)
+    # ---------------------------------------------------------
+
+    @staticmethod
+    async def _clean_stream(
+        stream: AsyncIterator[str]
+    ) -> AsyncIterator[str]:
+
+        buffer = ""
+
+        async for token in stream:
+
+            buffer += token
+
+            while True:
+
+                open_paren = buffer.find("(")
+
+                if open_paren == -1:
+
+                    if buffer:
+                        yield buffer
+                        buffer = ""
+
+                    break
+
+                close_paren = buffer.find(")", open_paren)
+
+                if close_paren != -1:
+
+                    start_idx = open_paren
+
+                    while start_idx > 0 and buffer[start_idx - 1] == " ":
+                        start_idx -= 1
+
+                    candidate = buffer[start_idx:close_paren + 1]
+
+                    if (
+                        PAGE_CITATION_PATTERN.fullmatch(candidate.strip())
+                        or PAGE_CITATION_PATTERN.fullmatch(candidate)
+                    ):
+
+                        if start_idx > 0:
+                            yield buffer[:start_idx]
+
+                        buffer = buffer[close_paren + 1:]
+
+                        if start_idx == 0:
+                            buffer = buffer.lstrip()
+
+                    else:
+
+                        yield buffer[:close_paren + 1]
+                        buffer = buffer[close_paren + 1:]
+
+                else:
+
+                    if open_paren > 0:
+
+                        start_idx = open_paren
+
+                        while start_idx > 0 and buffer[start_idx - 1] == " ":
+                            start_idx -= 1
+
+                        if start_idx > 0:
+                            yield buffer[:start_idx]
+                            buffer = buffer[start_idx:]
+
+                    if len(buffer) > 100:
+                        yield buffer
+                        buffer = ""
+
+                    break
+
+        if buffer:
+            cleaned = PAGE_CITATION_PATTERN.sub("", buffer)
+            if cleaned:
+                yield cleaned
+
+    # ---------------------------------------------------------
     # OPEN MODEL STREAM
     # ---------------------------------------------------------
 
@@ -79,7 +166,7 @@ class ChatService:
         prompt: str
     ) -> tuple[str, AsyncIterator[str]]:
 
-        stream = model_func(prompt)
+        stream = ChatService._clean_stream(model_func(prompt))
 
         first_token = await anext(stream)
 
@@ -125,13 +212,10 @@ class ChatService:
 
             logger.exception("Document retrieval failed.")
 
-            yield ChatService._sse({
-                "type": "error",
-                "message": (
-                    "Unable to search the hardware documentation. "
-                    "Please try again."
-                )
-            })
+            yield (
+                "Unable to search the hardware documentation. "
+                "Please try again."
+            )
 
             return
 
@@ -139,15 +223,7 @@ class ChatService:
 
         if not retrieval["results"]:
 
-            yield ChatService._sse({
-                "type": "token",
-                "content": NO_CONTEXT_MESSAGE
-            })
-
-            yield ChatService._sse({
-                "type": "done"
-            })
-
+            yield NO_CONTEXT_MESSAGE
             return
 
         # 3. BUILD RAG PROMPT
@@ -194,24 +270,13 @@ class ChatService:
 
             # 5. STREAM THE RESPONSE
 
-            yield ChatService._sse({
-                "type": "model",
-                "model": model_name
-            })
-
-            yield ChatService._sse({
-                "type": "token",
-                "content": first_token
-            })
+            yield first_token
 
             try:
 
                 async for token in stream:
 
-                    yield ChatService._sse({
-                        "type": "token",
-                        "content": token
-                    })
+                    yield token
 
             except Exception:
 
@@ -220,13 +285,10 @@ class ChatService:
                     model_name
                 )
 
-                yield ChatService._sse({
-                    "type": "error",
-                    "message": (
-                        f"{model_name} failed while generating "
-                        "the response. Please retry your question."
-                    )
-                })
+                yield (
+                    f"{model_name} failed while generating "
+                    "the response. Please retry your question."
+                )
 
                 return
 
@@ -237,26 +299,14 @@ class ChatService:
                 model_name
             )
 
-            yield ChatService._sse({
-                "type": "sources",
-                "sources": sources
-            })
-
-            yield ChatService._sse({
-                "type": "done"
-            })
-
             return
 
         # 7. ALL PROVIDERS FAILED
 
-        yield ChatService._sse({
-            "type": "error",
-            "message": (
-                "All configured LLM providers failed. "
-                "Please check API credentials, quotas and network connectivity."
-            )
-        })
+        yield (
+            "All configured LLM providers failed. "
+            "Please check API credentials, quotas and network connectivity."
+        )
 
 
 chat_service = ChatService()
