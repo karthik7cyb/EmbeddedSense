@@ -15,3 +15,4 @@ psycopg-pool
 PyJWT[crypto]
 
 langchain
+mcp
