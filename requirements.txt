@@ -12,3 +12,4 @@ pymupdf
 psycopg[binary]
 pgvector
 psycopg-pool
+PyJWT[crypto]
