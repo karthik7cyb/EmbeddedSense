@@ -51,7 +51,7 @@ async def chat(
 
     return StreamingResponse(
         chat_service.chat(user_prompt.strip()),
-        media_type="text/plain",
+        media_type="text/event-stream",
         status_code=200,
         headers={
             "Cache-Control": "no-cache",

@@ -1,18 +1,18 @@
 
-import asyncio
 import json
 import logging
-import random
 import re
 
 from collections.abc import AsyncIterator
 
 from app.ai.rag.pipeline import rag_pipeline
 from app.ai.models import models
+from app.ai.tools.router import route_query
 from app.ai.prompts.gemini_prompt import RAG_PROMPT_TEMPLATE
 
 
 logger = logging.getLogger("uvicorn.error")
+
 
 NO_CONTEXT_MESSAGE = (
     "I couldn't find relevant information in the available "
@@ -27,54 +27,6 @@ PAGE_CITATION_PATTERN = re.compile(
 
 
 class ChatService:
-
-    # ---------------------------------------------------------
-    # RETRY WITH EXPONENTIAL BACKOFF AND JITTER
-    # ---------------------------------------------------------
-
-    @staticmethod
-    async def retry_with_jitter(
-        func,
-        *args,
-        max_retries: int = 3,
-        base_delay: float = 1.0,
-        max_delay: float = 8.0,
-        **kwargs
-    ):
-
-        for attempt in range(1, max_retries + 1):
-
-            try:
-                return await func(*args, **kwargs)
-
-            except Exception as error:
-
-                if attempt >= max_retries:
-
-                    logger.error(
-                        "Request failed after %s attempts: %s",
-                        attempt,
-                        error
-                    )
-
-                    raise
-
-                backoff = min(
-                    max_delay,
-                    base_delay * (2 ** (attempt - 1))
-                )
-
-                sleep_time = random.uniform(0, backoff)
-
-                logger.warning(
-                    "Attempt %s/%s failed: %s. Retrying in %.2fs.",
-                    attempt,
-                    max_retries,
-                    error,
-                    sleep_time
-                )
-
-                await asyncio.sleep(sleep_time)
 
     # ---------------------------------------------------------
     # CLEAN STREAM (REMOVE PAGE CITATIONS)
@@ -153,33 +105,21 @@ class ChatService:
 
         if buffer:
             cleaned = PAGE_CITATION_PATTERN.sub("", buffer)
+
             if cleaned:
                 yield cleaned
-
-    # ---------------------------------------------------------
-    # OPEN MODEL STREAM
-    # ---------------------------------------------------------
-
-    @staticmethod
-    async def _open_stream(
-        model_func,
-        prompt: str
-    ) -> tuple[str, AsyncIterator[str]]:
-
-        stream = ChatService._clean_stream(model_func(prompt))
-
-        first_token = await anext(stream)
-
-        return first_token, stream
 
     # ---------------------------------------------------------
     # SERVER-SENT EVENTS
     # ---------------------------------------------------------
 
     @staticmethod
-    def _sse(event: dict) -> str:
+    def _sse(event: str, data: dict) -> str:
 
-        return f"data: {json.dumps(event)}\n\n"
+        return (
+            f"event: {event}\n"
+            f"data: {json.dumps(data)}\n\n"
+        )
 
     # ---------------------------------------------------------
     # MAIN CHAT FUNCTION
@@ -189,44 +129,128 @@ class ChatService:
     async def chat(user_prompt: str) -> AsyncIterator[str]:
 
         """
-        Retrieves relevant hardware documentation and generates
-        a streamed response using the configured LLM fallback chain.
+        Routes the user query to RAG or TOOL
+        and streams structured SSE events.
 
-        Event sequence:
-        model -> token -> sources -> done
-
-        If retrieval or all providers fail:
-        error
+        Router: Groq
+        Main LLM: Gemini
         """
 
-        # 1. RETRIEVE RELEVANT DOCUMENTATION
+        # 1. ROUTER STATUS
+
+        yield ChatService._sse(
+            "status",
+            {"message": "Classifying your query..."}
+        )
+
+        # 2. ROUTE THE USER QUERY
 
         try:
 
-            retrieval = await ChatService.retry_with_jitter(
-                rag_pipeline.retrieve,
-                user_prompt
+            route = await route_query(user_prompt)
+
+            logger.info("Selected route: %s", route)
+
+        except Exception:
+
+            logger.exception("Query routing failed.")
+
+            yield ChatService._sse(
+                "error",
+                {"message": "Unable to classify your query. Please try again."}
             )
+            return
+
+        # 3. SEND ROUTE EVENT
+
+        yield ChatService._sse(
+            "route",
+            {"route": route}
+        )
+
+        # -----------------------------------------------------
+        # 4. TOOL ROUTE
+        # -----------------------------------------------------
+
+        if route == "tool":
+
+            logger.info("Executing tool-based request.")
+
+            yield ChatService._sse(
+                "status",
+                {"message": "Processing your tool request..."}
+            )
+
+            try:
+
+                async for token in ChatService._clean_stream(
+                    models.stream_llm(user_prompt)
+                ):
+
+                    yield ChatService._sse(
+                        "token",
+                        {"content": token}
+                    )
+
+            except Exception:
+
+                logger.exception("Tool agent execution failed.")
+
+                yield ChatService._sse(
+                    "error",
+                    {"message": "Unable to execute the requested tool. Please try again."}
+                )
+                return
+
+            logger.info("Tool request completed.")
+
+            yield ChatService._sse(
+                "done",
+                {"status": "completed"}
+            )
+
+            return
+
+        # -----------------------------------------------------
+        # 5. RAG ROUTE
+        # -----------------------------------------------------
+
+        yield ChatService._sse(
+            "status",
+            {"message": "Searching hardware documentation..."}
+        )
+
+        try:
+
+            retrieval = await rag_pipeline.retrieve(user_prompt)
 
         except Exception:
 
             logger.exception("Document retrieval failed.")
 
-            yield (
-                "Unable to search the hardware documentation. "
-                "Please try again."
+            yield ChatService._sse(
+                "error",
+                {"message": "Unable to search the hardware documentation. Please try again."}
+            )
+            return
+
+        # 6. CHECK RETRIEVAL RESULTS
+
+        if not retrieval["results"]:
+
+            yield ChatService._sse(
+                "token",
+                {"content": NO_CONTEXT_MESSAGE}
+            )
+
+            yield ChatService._sse(
+                "done",
+                {"status": "completed"}
             )
 
             return
 
-        # 2. CHECK RETRIEVAL RESULTS
-
-        if not retrieval["results"]:
-
-            yield NO_CONTEXT_MESSAGE
-            return
-
-        # 3. BUILD RAG PROMPT
+        # 7. BUILD RAG PROMPT
 
         context, sources = rag_pipeline.build_context(
             retrieval["results"]
@@ -237,75 +261,43 @@ class ChatService:
             question=user_prompt
         )
 
-        logger.info("Starting EmbeddedSense LLM request.")
+        logger.info("Starting EmbeddedSense RAG request.")
 
-        # 4. GET PROVIDER FALLBACK CHAIN
+        yield ChatService._sse(
+            "status",
+            {"message": "Generating hardware diagnosis..."}
+        )
 
-        fallback_chain = models.get_fallback_chain()
+        # 8. STREAM RAG RESPONSE
 
-        # Expected priority:
-        # Gemini -> Groq
+        try:
 
-        for model_name, model_func in fallback_chain:
+            async for token in ChatService._clean_stream(
+                models.stream_llm(prompt)
+            ):
 
-            logger.info("Trying LLM provider: %s", model_name)
-
-            try:
-
-                # Retry until the first token is received.
-                first_token, stream = await ChatService.retry_with_jitter(
-                    ChatService._open_stream,
-                    model_func,
-                    prompt
+                yield ChatService._sse(
+                    "token",
+                    {"content": token}
                 )
 
-            except Exception:
+        except Exception:
 
-                logger.exception(
-                    "Provider %s failed. Trying next provider.",
-                    model_name
-                )
+            logger.exception("RAG agent execution failed.")
 
-                continue
-
-            # 5. STREAM THE RESPONSE
-
-            yield first_token
-
-            try:
-
-                async for token in stream:
-
-                    yield token
-
-            except Exception:
-
-                logger.exception(
-                    "Provider %s failed during streaming.",
-                    model_name
-                )
-
-                yield (
-                    f"{model_name} failed while generating "
-                    "the response. Please retry your question."
-                )
-
-                return
-
-            # 6. RESPONSE COMPLETED
-
-            logger.info(
-                "Successfully answered using %s.",
-                model_name
+            yield ChatService._sse(
+                "error",
+                {"message": "Unable to generate the diagnosis. Please try again."}
             )
-
             return
 
-        # 7. ALL PROVIDERS FAILED
+        # 9. RESPONSE COMPLETED
 
-        yield (
-            "All configured LLM providers failed. "
-            "Please check API credentials, quotas and network connectivity."
+        logger.info("Successfully completed EmbeddedSense request.")
+
+        yield ChatService._sse(
+            "done",
+            {"status": "completed"}
         )
 
 
